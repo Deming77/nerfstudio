@@ -23,24 +23,18 @@ from pathlib import Path
 from typing import Callable, Literal, Optional, Tuple
 
 import torch
+import tyro
 import yaml
 
 from nerfstudio.configs.method_configs import all_methods
+from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManagerConfig
 from nerfstudio.engine.trainer import TrainerConfig
 from nerfstudio.pipelines.base_pipeline import Pipeline
+from nerfstudio.utils.io import replace_data_root
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
-def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Path, int]:
-    ## TODO: ideally eventually want to get this to be the same as whatever is used to load train checkpoint too
-    """Helper function to load checkpointed pipeline
-
-    Args:
-        config (DictConfig): Configuration of pipeline to load
-        pipeline (Pipeline): Pipeline instance of which to load weights
-    Returns:
-        A tuple of the path to the loaded checkpoint and the step at which it was saved.
-    """
+def eval_find_checkpoint(config: TrainerConfig):
     assert config.load_dir is not None
     if config.load_step is None:
         CONSOLE.print("Loading latest checkpoint from load_dir")
@@ -58,6 +52,20 @@ def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Pat
         load_step = config.load_step
     load_path = config.load_dir / f"step-{load_step:09d}.ckpt"
     assert load_path.exists(), f"Checkpoint {load_path} does not exist"
+    return load_path, load_step
+
+
+def eval_load_checkpoint(config: TrainerConfig, pipeline: Pipeline) -> Tuple[Path, int]:
+    ## TODO: ideally eventually want to get this to be the same as whatever is used to load train checkpoint too
+    """Helper function to load checkpointed pipeline
+
+    Args:
+        config (DictConfig): Configuration of pipeline to load
+        pipeline (Pipeline): Pipeline instance of which to load weights
+    Returns:
+        A tuple of the path to the loaded checkpoint and the step at which it was saved.
+    """
+    load_path, load_step = eval_find_checkpoint(config)
     loaded_state = torch.load(load_path, map_location="cpu")
     pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
     CONSOLE.print(f":white_check_mark: Done loading checkpoint from {load_path}")
@@ -68,6 +76,8 @@ def eval_setup(
     config_path: Path,
     eval_num_rays_per_chunk: Optional[int] = None,
     test_mode: Literal["test", "val", "inference"] = "test",
+    extra_args: list[str] | None = None,
+    load_checkpoint: bool = True,
     update_config_callback: Optional[Callable[[TrainerConfig], TrainerConfig]] = None,
 ) -> Tuple[TrainerConfig, Pipeline, Path, int]:
     """Shared setup for loading a saved pipeline for evaluation.
@@ -89,6 +99,19 @@ def eval_setup(
     config = yaml.load(config_path.read_text(), Loader=yaml.Loader)
     assert isinstance(config, TrainerConfig)
 
+    if extra_args is not None and len(extra_args) > 0:
+        config = tyro.cli(TrainerConfig, args=extra_args, default=config)
+        CONSOLE.print("------------\nOverriden config:\n" + yaml.dump(config) + "------------")
+
+    data_root = os.environ.get("DATA_ROOT", "/data")
+    config.data = replace_data_root(config.data, data_root)
+    config.pipeline.datamanager.data = config.data
+    CONSOLE.log(f"Data: {config.data}")
+
+    mask_path = config.pipeline.datamanager.dataparser.mask_root
+    if mask_path is not None and len(mask_path) > 0:
+        config.pipeline.datamanager.dataparser.mask_root = replace_data_root(mask_path, data_root)
+
     config.pipeline.datamanager._target = all_methods[config.method_name].pipeline.datamanager._target
     if eval_num_rays_per_chunk:
         config.pipeline.model.eval_num_rays_per_chunk = eval_num_rays_per_chunk
@@ -98,15 +121,25 @@ def eval_setup(
 
     # load checkpoints from wherever they were saved
     # TODO: expose the ability to choose an arbitrary checkpoint
-    config.load_dir = config.get_checkpoint_dir()
+    if isinstance(config.pipeline.datamanager, VanillaDataManagerConfig):
+        config.pipeline.datamanager.eval_image_indices = None
+
+    if load_checkpoint:
+        config.load_dir = config.get_checkpoint_dir()
+        checkpoint_path, step = eval_find_checkpoint(config)
+    else:
+        checkpoint_path, step = "", 0
 
     # setup pipeline (which includes the DataManager)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    pipeline = config.pipeline.setup(device=device, test_mode=test_mode)
+    pipeline = config.pipeline.setup(device=device, test_mode=test_mode, checkpoint_file=checkpoint_path)
     assert isinstance(pipeline, Pipeline)
     pipeline.eval()
+    pipeline.datamanager.setup_train(load_data=False)
+    pipeline.datamanager.setup_eval()
 
     # load checkpointed information
-    checkpoint_path, step = eval_load_checkpoint(config, pipeline)
+    if load_checkpoint:
+        checkpoint_path, step = eval_load_checkpoint(config, pipeline)
 
     return config, pipeline, checkpoint_path, step

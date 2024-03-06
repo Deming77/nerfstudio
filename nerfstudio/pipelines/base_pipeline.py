@@ -24,18 +24,22 @@ from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union, cast
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from PIL import Image
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 from torch import nn
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.nn import Parameter
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nerfstudio.configs import base_config as cfg
 from nerfstudio.configs.base_config import InstantiateConfig
 from nerfstudio.data.datamanagers.base_datamanager import DataManager, DataManagerConfig, VanillaDataManager
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
+from nerfstudio.data.utils.dataloaders import FixedIndicesEvalDataloader
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
@@ -175,8 +179,12 @@ class Pipeline(nn.Module):
     @abstractmethod
     @profiler.time_function
     def get_average_eval_image_metrics(
-        self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
-    ):
+        self,
+        step: Optional[int] = None,
+        output_path: Optional[Path] = None,
+        get_std: bool = False,
+        get_raw: bool = False,
+    ) -> typing.Union[dict[str, float], tuple[dict[str, float], dict[str, float]]]:
         """Iterate over all the images in the eval dataset and get the average.
 
         Args:
@@ -247,6 +255,7 @@ class VanillaPipeline(Pipeline):
         world_size: int = 1,
         local_rank: int = 0,
         grad_scaler: Optional[GradScaler] = None,
+        **kwargs,
     ):
         super().__init__()
         self.config = config
@@ -274,6 +283,7 @@ class VanillaPipeline(Pipeline):
             device=device,
             grad_scaler=grad_scaler,
             seed_points=seed_pts,
+            **kwargs,
         )
         self.model.to(device)
 
@@ -343,9 +353,70 @@ class VanillaPipeline(Pipeline):
         self.train()
         return metrics_dict, images_dict
 
+    def get_num_evals(self):
+        assert isinstance(self.datamanager, VanillaDataManager)
+        return len(self.datamanager.fixed_indices_eval_dataloader.image_indices)
+
+    def eval_single_image(
+        self,
+        idx: int,
+        output_path: Optional[Path] = None,
+        loader: Optional[FixedIndicesEvalDataloader] = None,
+        image_format: str = "png",
+        raw_data_keys: list[str] = None,
+    ):
+        raw_data_keys = raw_data_keys or []
+
+        self.eval()
+
+        if loader is None:
+            assert isinstance(self.datamanager, VanillaDataManager)
+            loader = self.datamanager.fixed_indices_eval_dataloader
+
+        camera_ray_bundle, batch = loader.get_data_from_image_idx(loader.image_indices[idx])
+        if self.model.is_image_based():
+            camera_ray_bundle.metadata["camera"] = loader.cameras[idx]
+
+        outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+        metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
+
+        if output_path is not None:
+            camera_indices = camera_ray_bundle.camera_indices
+            assert camera_indices is not None
+            file_stem = f"{int(camera_indices[0, 0, 0]):06d}"
+            image_file_name = f"{file_stem}.{image_format}"
+            raw_file_name = f"{file_stem}.npy"
+
+            for key in raw_data_keys:
+                if key not in outputs:
+                    continue
+                folder = output_path / f"raw_{key}"
+                folder.mkdir(parents=True, exist_ok=True)
+
+                np.save(folder / raw_file_name, outputs[key].cpu().numpy())
+
+            for key, val in images_dict.items():
+                save_args = {
+                    "png": {},
+                    "jpg": {
+                        "quality": 95
+                    },
+                }[image_format]
+                folder = output_path / key
+                folder.mkdir(parents=True, exist_ok=True)
+                Image.fromarray((val * 255).byte().cpu().numpy()).save(folder / image_file_name, **save_args)
+
+        self.train()
+
+        return metrics_dict
+
     @profiler.time_function
     def get_average_eval_image_metrics(
-        self, step: Optional[int] = None, output_path: Optional[Path] = None, get_std: bool = False
+        self,
+        step: Optional[int] = None,
+        output_path: Optional[Path] = None,
+        get_std: bool = False,
+        get_raw: bool = False,
     ):
         """Iterate over all the images in the eval dataset and get the average.
 
@@ -369,15 +440,20 @@ class VanillaPipeline(Pipeline):
             transient=True,
         ) as progress:
             task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
+            idx = 0
             for camera, batch in self.datamanager.fixed_indices_eval_dataloader:
+                idx += 1
                 # time this the following line
                 inner_start = time()
                 outputs = self.model.get_outputs_for_camera(camera=camera)
                 height, width = camera.height, camera.width
                 num_rays = height * width
-                metrics_dict, _ = self.model.get_image_metrics_and_images(outputs, batch)
+                metrics_dict, images_dict = self.model.get_image_metrics_and_images(outputs, batch)
                 if output_path is not None:
-                    raise NotImplementedError("Saving images is not implemented yet")
+                    for key, val in images_dict.items():
+                        folder = output_path / key
+                        folder.mkdir(exist_ok=True)
+                        Image.fromarray((val * 255).byte().cpu().numpy()).save(folder / f"{idx:06d}.png", optimize=True)
 
                 assert "num_rays_per_sec" not in metrics_dict
                 metrics_dict["num_rays_per_sec"] = (num_rays / (time() - inner_start)).item()
@@ -388,18 +464,22 @@ class VanillaPipeline(Pipeline):
                 progress.advance(task)
         # average the metrics list
         metrics_dict = {}
+        raw_metrics_dict = {}
         for key in metrics_dict_list[0].keys():
+            metric_data = torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
+            if get_raw:
+                raw_metrics_dict[key] = metric_data.tolist()
+
             if get_std:
-                key_std, key_mean = torch.std_mean(
-                    torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
-                )
+                key_std, key_mean = torch.std_mean(metric_data)
                 metrics_dict[key] = float(key_mean)
                 metrics_dict[f"{key}_std"] = float(key_std)
             else:
-                metrics_dict[key] = float(
-                    torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
-                )
+                metrics_dict[key] = float(torch.mean(metric_data))
         self.train()
+
+        if get_raw:
+            return metrics_dict, raw_metrics_dict
         return metrics_dict
 
     def load_pipeline(self, loaded_state: Dict[str, Any], step: int) -> None:
@@ -434,3 +514,6 @@ class VanillaPipeline(Pipeline):
         model_params = self.model.get_param_groups()
         # TODO(ethan): assert that key names don't overlap
         return {**datamanager_params, **model_params}
+
+    def modify_optimizer_config(self, config: dict[str, dict[str, Any]]):
+        self.model.modify_optimizer_config(config)

@@ -18,6 +18,7 @@ Datamanager.
 
 from __future__ import annotations
 
+import random
 from abc import abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -40,6 +41,7 @@ from typing import (
     get_origin,
 )
 
+import numpy as np
 import torch
 import tyro
 from torch import nn
@@ -177,10 +179,6 @@ class DataManager(nn.Module):
         super().__init__()
         self.train_count = 0
         self.eval_count = 0
-        if self.train_dataset and self.test_mode != "inference":
-            self.setup_train()
-        if self.eval_dataset and self.test_mode != "inference":
-            self.setup_eval()
 
     def forward(self):
         """Blank forward method
@@ -228,7 +226,7 @@ class DataManager(nn.Module):
         return IterableWrapper(self.iter_eval, self.next_eval, length)
 
     @abstractmethod
-    def setup_train(self):
+    def setup_train(self, load_data: bool):
         """Sets up the data manager for training.
 
         Here you will define any subclass specific object attributes from the attribute"""
@@ -341,6 +339,10 @@ class VanillaDataManagerConfig(DataManagerConfig):
     """Deprecated, has been moved to the model config."""
     pixel_sampler: PixelSamplerConfig = field(default_factory=PixelSamplerConfig)
     """Specifies the pixel sampler used to sample pixels from images."""
+    image_based_pipeline: bool = False
+    """Use image-based pipeline"""
+    train_exclude_indices: list[int] = field(default_factory=list)
+    """Exclude certain images from training"""
 
     def __post_init__(self):
         """Warn user of camera optimizer change."""
@@ -419,7 +421,16 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
                         CONSOLE.print("Variable resolution, using variable_res_collate")
                         self.config.collate_fn = variable_res_collate
                         break
+
+        CONSOLE.log(f"Datasets: train ({len(self.train_dataset)}), eval ({len(self.eval_dataset)})")
+        self.train_image_idx = 0
+        self.train_image_indices = self.create_shuffled_train_indices()
         super().__init__()
+
+    def create_shuffled_train_indices(self) -> np.ndarray:
+        indices = np.array([i for i in range(len(self.train_dataset)) if i not in self.config.train_exclude_indices])
+        np.random.shuffle(indices)
+        return indices
 
     @cached_property
     def dataset_type(self) -> Type[TDataset]:
@@ -464,7 +475,7 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         """Infer pixel sampler to use."""
         if self.config.patch_size > 1 and type(self.config.pixel_sampler) is PixelSamplerConfig:
             return PatchPixelSamplerConfig().setup(
-                patch_size=self.config.patch_size, num_rays_per_batch=num_rays_per_batch
+                patch_size=self.config.patch_size, num_rays_per_batch=num_rays_per_batch, dataset=dataset
             )
         is_equirectangular = (dataset.cameras.camera_type == CameraType.EQUIRECTANGULAR.value).all()
         if is_equirectangular.any():
@@ -478,23 +489,25 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
             is_equirectangular=is_equirectangular,
             num_rays_per_batch=num_rays_per_batch,
             fisheye_crop_radius=fisheye_crop_radius,
+            dataset=dataset,
         )
 
-    def setup_train(self):
+    def setup_train(self, load_data: bool):
         """Sets up the data loaders for training"""
         assert self.train_dataset is not None
         CONSOLE.print("Setting up training dataset...")
-        self.train_image_dataloader = CacheDataloader(
-            self.train_dataset,
-            num_images_to_sample_from=self.config.train_num_images_to_sample_from,
-            num_times_to_repeat_images=self.config.train_num_times_to_repeat_images,
-            device=self.device,
-            num_workers=self.world_size * 4,
-            pin_memory=True,
-            collate_fn=self.config.collate_fn,
-            exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
-        )
-        self.iter_train_image_dataloader = iter(self.train_image_dataloader)
+        if load_data:
+            self.train_image_dataloader = CacheDataloader(
+                self.train_dataset,
+                num_images_to_sample_from=self.config.train_num_images_to_sample_from,
+                num_times_to_repeat_images=self.config.train_num_times_to_repeat_images,
+                device=self.device,
+                num_workers=self.world_size * 4,
+                pin_memory=True,
+                collate_fn=self.config.collate_fn,
+                exclude_batch_keys_from_device=self.exclude_batch_keys_from_device,
+            )
+            self.iter_train_image_dataloader = iter(self.train_image_dataloader)
         self.train_pixel_sampler = self._get_pixel_sampler(self.train_dataset, self.config.train_num_rays_per_batch)
         self.train_ray_generator = RayGenerator(self.train_dataset.cameras.to(self.device))
 
@@ -533,9 +546,38 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         image_batch = next(self.iter_train_image_dataloader)
         assert self.train_pixel_sampler is not None
         assert isinstance(image_batch, dict)
-        batch = self.train_pixel_sampler.sample(image_batch)
-        ray_indices = batch["indices"]
-        ray_bundle = self.train_ray_generator(ray_indices)
+
+        metadata = {}
+        if self.config.image_based_pipeline:
+            idx = self.train_image_indices[self.train_image_idx]
+            self.train_image_idx += 1
+            if self.train_image_idx == len(self.train_image_indices):
+                self.train_image_indices = self.create_shuffled_train_indices()
+                self.train_image_idx = 0
+
+            batch = {k: image_batch[k][idx] for k in image_batch}
+            camera_idx = int(batch["image_idx"])
+
+            H, W = batch["image"].shape[:2]
+            ray_indices = torch.arange(H * W, dtype=torch.long)
+            ray_indices = torch.stack(
+                [
+                    torch.ones(H * W, dtype=torch.long) * camera_idx,
+                    ray_indices // W,
+                    ray_indices % W,
+                ],
+                dim=-1,
+            )
+            batch["indices"] = ray_indices
+            metadata["camera_idx"] = camera_idx
+            metadata["camera"] = self.train_dataset.cameras[camera_idx]
+        else:
+            batch = self.train_pixel_sampler.sample(image_batch)
+            ray_indices = batch["indices"]
+
+        ray_bundle: RayBundle = self.train_ray_generator(ray_indices)
+        ray_bundle.metadata.update(metadata)
+
         return ray_bundle, batch
 
     def next_eval(self, step: int) -> Tuple[RayBundle, Dict]:

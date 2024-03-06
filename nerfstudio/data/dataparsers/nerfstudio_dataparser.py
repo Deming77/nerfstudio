@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional, Tuple, Type
@@ -73,6 +74,10 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """The interval between frames to use for eval. Only used when eval_mode is eval-interval."""
     depth_unit_scale_factor: float = 1e-3
     """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
+    mask_root: Optional[str] = None
+    """Folder containing mask files, overrides mask_path in frame"""
+    special_mask_roots: list[str] = field(default_factory=list)
+    """Folders containing special mask files, in the format name:root"""
     mask_color: Optional[Tuple[float, float, float]] = None
     """Replace the unknown pixels with this color. Relevant if you have a mask but still sample everywhere."""
     load_3D_points: bool = False
@@ -86,8 +91,8 @@ class Nerfstudio(DataParser):
     config: NerfstudioDataParserConfig
     downscale_factor: Optional[int] = None
 
-    def _generate_dataparser_outputs(self, split="train"):
-        assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
+    def __init__(self, config: NerfstudioDataParserConfig):
+        super().__init__(config)
 
         if self.config.data.suffix == ".json":
             meta = load_from_json(self.config.data)
@@ -96,10 +101,89 @@ class Nerfstudio(DataParser):
             meta = load_from_json(self.config.data / "transforms.json")
             data_dir = self.config.data
 
-        image_filenames = []
+        image_filepaths: list[Path] = []
+
+        # sort the frames by fname
+        fnames = []
+        for frame in meta["frames"]:
+            filepath = Path(frame["file_path"])
+            image_filepaths.append(filepath)
+            fname = self._get_fname(filepath, data_dir)
+            fnames.append(fname)
+        inds = np.argsort(fnames)
+        frames = [meta["frames"][ind] for ind in inds]
+        image_filenames = [fnames[ind] for ind in inds]
+        image_filepaths = [image_filepaths[ind] for ind in inds]
+        test_image_mask = torch.zeros(len(image_filenames), dtype=torch.bool)
+
+        # get splits
+        has_split_files_spec = any(f"{split}_filenames" in meta for split in ("train", "val", "test"))
+        all_indices = {}
+        for split in ["train", "test", "val"]:
+            if f"{split}_filenames" in meta:
+                # Validate split first
+                split_filenames = set(self._get_fname(Path(x), data_dir) for x in meta[f"{split}_filenames"])
+                unmatched_filenames = split_filenames.difference(image_filenames)
+                if unmatched_filenames:
+                    raise RuntimeError(f"Some filenames for split {split} were not found: {unmatched_filenames}.")
+
+                indices = [i for i, path in enumerate(image_filenames) if path in split_filenames]
+                CONSOLE.log(f"[yellow] Dataset is overriding {split}_indices to {len(indices)} indices")
+                indices = np.array(indices, dtype=np.int32)
+            elif has_split_files_spec:
+                raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
+            else:
+                # find train and eval indices based on the eval_mode specified
+                if self.config.eval_mode == "fraction":
+                    i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
+                elif self.config.eval_mode == "filename":
+                    i_train, i_eval = get_train_eval_split_filename(image_filenames)
+                elif self.config.eval_mode == "interval":
+                    i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
+                elif self.config.eval_mode == "all":
+                    CONSOLE.log(
+                        "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
+                    )
+                    i_train, i_eval = get_train_eval_split_all(image_filenames)
+                else:
+                    raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
+
+                if split == "train":
+                    indices = i_train
+                elif split in ["val", "test"]:
+                    indices = i_eval
+                else:
+                    raise ValueError(f"Unknown dataparser split {split}")
+
+            all_indices[split] = indices
+
+        test_image_mask[all_indices["test"]] = True
+        train_timestamps = [frames[idx].get("timestamp", 0) for idx in all_indices["train"]]
+
+        self.all_indices = all_indices
+        self.meta = meta
+        self.frames = frames
+        self.data_dir = data_dir
+        self.image_filenames = image_filenames
+        self.global_data = {
+            "test_image_mask": test_image_mask,
+            "test_image_indices": torch.from_numpy(all_indices["test"]),
+            "train_timestamps": torch.tensor(train_timestamps),
+        }
+
+    def _generate_dataparser_outputs(self, split="train"):
+        assert self.config.data.exists(), f"Data directory {self.config.data} does not exist."
+
+        meta = self.meta
+        frames = self.frames
+        data_dir = self.data_dir
+        image_filenames = self.image_filenames
+
         mask_filenames = []
         depth_filenames = []
+        special_mask_filenames = defaultdict(list)
         poses = []
+        timestamps = []
 
         fx_fixed = "fl_x" in meta
         fy_fixed = "fl_y" in meta
@@ -121,19 +205,7 @@ class Nerfstudio(DataParser):
         width = []
         distort = []
 
-        # sort the frames by fname
-        fnames = []
-        for frame in meta["frames"]:
-            filepath = Path(frame["file_path"])
-            fname = self._get_fname(filepath, data_dir)
-            fnames.append(fname)
-        inds = np.argsort(fnames)
-        frames = [meta["frames"][ind] for ind in inds]
-
         for frame in frames:
-            filepath = Path(frame["file_path"])
-            fname = self._get_fname(filepath, data_dir)
-
             if not fx_fixed:
                 assert "fl_x" in frame, "fx not specified in frame"
                 fx.append(float(frame["fl_x"]))
@@ -166,9 +238,15 @@ class Nerfstudio(DataParser):
                     )
                 )
 
-            image_filenames.append(fname)
             poses.append(np.array(frame["transform_matrix"]))
-            if "mask_path" in frame:
+            if self.config.mask_root is not None:
+                mask_fname = Path(self.config.mask_root) / frame["file_path"]
+                mask_fname = mask_fname.parent / f"{mask_fname.stem}.png"
+                if not mask_fname.exists():
+                    mask_fname = Path(self.config.mask_root) / (Path(frame["file_path"]).stem + ".png")
+                assert mask_fname.exists(), f"mask not found: {mask_fname}"
+                mask_filenames.append(mask_fname)
+            elif "mask_path" in frame:
                 mask_filepath = Path(frame["mask_path"])
                 mask_fname = self._get_fname(
                     mask_filepath,
@@ -177,10 +255,21 @@ class Nerfstudio(DataParser):
                 )
                 mask_filenames.append(mask_fname)
 
+            for special_mask_root_cfg in self.config.special_mask_roots:
+                mask_key, mask_root = special_mask_root_cfg.split(":")
+                mask_fname = Path(mask_root) / frame["file_path"]
+                mask_fname = mask_fname.parent / f"{mask_fname.stem}.png"
+                if not mask_fname.exists():
+                    mask_fname = Path(self.config.mask_root) / (Path(frame["file_path"]).stem + ".png")
+                assert mask_fname.exists(), f"mask ({mask_key}) not found: {mask_fname}"
+                special_mask_filenames[mask_key].append(mask_fname)
+
             if "depth_file_path" in frame:
                 depth_filepath = Path(frame["depth_file_path"])
                 depth_fname = self._get_fname(depth_filepath, data_dir, downsample_folder_prefix="depths_")
                 depth_filenames.append(depth_fname)
+
+            timestamps.append(frame.get("timestamp", 0))
 
         assert len(mask_filenames) == 0 or (len(mask_filenames) == len(image_filenames)), """
         Different number of image and mask filenames.
@@ -191,41 +280,11 @@ class Nerfstudio(DataParser):
         You should check that depth_file_path is specified for every frame (or zero frames) in transforms.json.
         """
 
-        has_split_files_spec = any(f"{split}_filenames" in meta for split in ("train", "val", "test"))
-        if f"{split}_filenames" in meta:
-            # Validate split first
-            split_filenames = set(self._get_fname(Path(x), data_dir) for x in meta[f"{split}_filenames"])
-            unmatched_filenames = split_filenames.difference(image_filenames)
-            if unmatched_filenames:
-                raise RuntimeError(f"Some filenames for split {split} were not found: {unmatched_filenames}.")
-
-            indices = [i for i, path in enumerate(image_filenames) if path in split_filenames]
-            CONSOLE.log(f"[yellow] Dataset is overriding {split}_indices to {indices}")
-            indices = np.array(indices, dtype=np.int32)
-        elif has_split_files_spec:
-            raise RuntimeError(f"The dataset's list of filenames for split {split} is missing.")
+        indices = self.all_indices[split]
+        if len(indices) <= 50:
+            CONSOLE.log(f"[yellow] {split} has {len(indices)} files: {list(indices)}")
         else:
-            # find train and eval indices based on the eval_mode specified
-            if self.config.eval_mode == "fraction":
-                i_train, i_eval = get_train_eval_split_fraction(image_filenames, self.config.train_split_fraction)
-            elif self.config.eval_mode == "filename":
-                i_train, i_eval = get_train_eval_split_filename(image_filenames)
-            elif self.config.eval_mode == "interval":
-                i_train, i_eval = get_train_eval_split_interval(image_filenames, self.config.eval_interval)
-            elif self.config.eval_mode == "all":
-                CONSOLE.log(
-                    "[yellow] Be careful with '--eval-mode=all'. If using camera optimization, the cameras may diverge in the current implementation, giving unpredictable results."
-                )
-                i_train, i_eval = get_train_eval_split_all(image_filenames)
-            else:
-                raise ValueError(f"Unknown eval mode {self.config.eval_mode}")
-
-            if split == "train":
-                indices = i_train
-            elif split in ["val", "test"]:
-                indices = i_eval
-            else:
-                raise ValueError(f"Unknown dataparser split {split}")
+            CONSOLE.log(f"[yellow] {split} has {len(indices)} files, first 50: {list(indices[:50])}")
 
         if "orientation_override" in meta:
             orientation_method = meta["orientation_override"]
@@ -252,6 +311,7 @@ class Nerfstudio(DataParser):
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
+        special_mask_filenames = {key: [lst[i] for i in indices] for key, lst in special_mask_filenames.items()}
 
         idx_tensor = torch.tensor(indices, dtype=torch.long)
         poses = poses[idx_tensor]
@@ -292,12 +352,16 @@ class Nerfstudio(DataParser):
         else:
             distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
+        CONSOLE.print(f"poses[0]: {poses[0, :3, :4]}")
+        CONSOLE.print(f"aabb_scale: {aabb_scale}")
+        CONSOLE.print(f"scale_factor: {scale_factor}")
         # Only add fisheye crop radius parameter if the images are actually fisheye, to allow the same config to be used
         # for both fisheye and non-fisheye datasets.
         metadata = {}
         if (camera_type in [CameraType.FISHEYE, CameraType.FISHEYE624]) and (fisheye_crop_radius is not None):
             metadata["fisheye_crop_radius"] = fisheye_crop_radius
 
+        metadata["timestamp"] = torch.tensor(timestamps)
         cameras = Cameras(
             fx=fx,
             fy=fy,
@@ -310,6 +374,9 @@ class Nerfstudio(DataParser):
             camera_type=camera_type,
             metadata=metadata,
         )
+
+        if split == "train":
+            self.global_data["train_cameras"] = cameras
 
         assert self.downscale_factor is not None
         cameras.rescale_output_resolution(scaling_factor=1.0 / self.downscale_factor)
@@ -413,7 +480,9 @@ class Nerfstudio(DataParser):
             metadata={
                 "depth_filenames": depth_filenames if len(depth_filenames) > 0 else None,
                 "depth_unit_scale_factor": self.config.depth_unit_scale_factor,
+                "special_mask_filenames": special_mask_filenames,
                 "mask_color": self.config.mask_color,
+                **self.global_data,
                 **metadata,
             },
         )
@@ -486,5 +555,17 @@ class Nerfstudio(DataParser):
                 self.downscale_factor = self.config.downscale_factor
 
         if self.downscale_factor > 1:
-            return data_dir / f"{downsample_folder_prefix}{self.downscale_factor}" / filepath.name
+            prefix_dir = data_dir / f"{downsample_folder_prefix}{self.downscale_factor}"
+            searches = (
+                prefix_dir,
+                prefix_dir / filepath.parent,
+            )
+            for extension in [".jpg", ".jpeg", ".png"]:
+                for search in searches:
+                    file = search / f"{filepath.stem}{extension}"
+                    if file.exists():
+                        return file
+
+            raise ValueError(f"Unable to find {filepath} in {prefix_dir}")
+
         return data_dir / filepath

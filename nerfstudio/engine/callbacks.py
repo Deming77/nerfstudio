@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 from inspect import signature
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from torch.cuda.amp.grad_scaler import GradScaler
@@ -44,6 +45,7 @@ class TrainingCallbackAttributes:
     """gradient scalers"""
     pipeline: Optional["Pipeline"]  # Prevent circular import.
     """reference to training pipeline"""
+    base_dir: Path
     trainer: Optional["Trainer"]  # Prevent circular import.
     """reference to trainer"""
 
@@ -54,6 +56,7 @@ class TrainingCallbackLocation(Enum):
     BEFORE_TRAIN_ITERATION = auto()
     AFTER_TRAIN_ITERATION = auto()
     AFTER_TRAIN = auto()
+    BEFORE_OPTIMIZER_STEP = auto()
 
 
 class TrainingCallback:

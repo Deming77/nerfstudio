@@ -36,11 +36,12 @@ from torch.cuda.amp.grad_scaler import GradScaler
 from nerfstudio.configs.experiment_config import ExperimentConfig
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
 from nerfstudio.engine.optimizers import Optimizers
-from nerfstudio.pipelines.base_pipeline import VanillaPipeline
+from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils import profiler, writer
 from nerfstudio.utils.decorators import check_eval_enabled, check_main_thread, check_viewer_enabled
 from nerfstudio.utils.misc import step_check
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils.timer import timer
 from nerfstudio.utils.writer import EventName, TimeWriter
 from nerfstudio.viewer.viewer import Viewer as ViewerState
 from nerfstudio.viewer_legacy.server.viewer_state import ViewerLegacyState
@@ -82,6 +83,8 @@ class TrainerConfig(ExperimentConfig):
     """Path to checkpoint file."""
     log_gradients: bool = False
     """Optionally log gradients during training"""
+    enable_timer: bool = False
+    """Whether to enable our timer"""
     gradient_accumulation_steps: Dict[str, int] = field(default_factory=lambda: {})
     """Number of steps to accumulate gradients over. Contains a mapping of {param_group:num}"""
 
@@ -146,13 +149,20 @@ class Trainer:
                 'test': loads train/test datasets into memory
                 'inference': does not load any dataset into memory
         """
+        if self.config.enable_timer:
+            timer.enabled = True
+
         self.pipeline = self.config.pipeline.setup(
             device=self.device,
             test_mode=test_mode,
             world_size=self.world_size,
             local_rank=self.local_rank,
             grad_scaler=self.grad_scaler,
+            checkpoint_file=self._find_checkpoint(),
         )
+        assert isinstance(self.pipeline, Pipeline)
+        self.pipeline.datamanager.setup_train(load_data=True)
+        self.pipeline.datamanager.setup_eval()
         self.optimizers = self.setup_optimizers()
 
         # set up viewer if enabled
@@ -191,7 +201,11 @@ class Trainer:
 
         self.callbacks = self.pipeline.get_training_callbacks(
             TrainingCallbackAttributes(
-                optimizers=self.optimizers, grad_scaler=self.grad_scaler, pipeline=self.pipeline, trainer=self
+                optimizers=self.optimizers,
+                grad_scaler=self.grad_scaler,
+                pipeline=self.pipeline,
+                base_dir=Path(self.base_dir),
+                trainer=self,
             )
         )
 
@@ -218,6 +232,7 @@ class Trainer:
             The optimizers object given the trainer config.
         """
         optimizer_config = self.config.optimizers.copy()
+        self.pipeline.modify_optimizer_config(optimizer_config)
         param_groups = self.pipeline.get_param_groups()
         return Optimizers(optimizer_config, param_groups)
 
@@ -286,13 +301,13 @@ class Trainer:
                 if self.pipeline.datamanager.eval_dataset:
                     self.eval_iteration(step)
 
-                if step_check(step, self.config.steps_per_save):
-                    self.save_checkpoint(step)
+                if step_check(step + 1, self.config.steps_per_save):
+                    self.save_checkpoint(step + 1)
 
                 writer.write_out_storage()
 
         # save checkpoint at the end of training
-        self.save_checkpoint(step)
+        self.save_checkpoint(step + 1)
 
         # write out any remaining events (e.g., total train time)
         writer.write_out_storage()
@@ -313,6 +328,11 @@ class Trainer:
 
         if not self.config.viewer.quit_on_train_completion:
             self._train_complete_viewer()
+
+        if timer.enabled:
+            timer_result = timer.get_results_string()
+            (self.base_dir / "timer.txt").write_text(timer_result)
+            CONSOLE.print(timer_result)
 
     @check_main_thread
     def _check_viewer_warnings(self) -> None:
@@ -388,6 +408,22 @@ class Trainer:
 
     def _load_checkpoint(self) -> None:
         """Helper function to load pipeline and optimizer from prespecified checkpoint"""
+        checkpoint_file = self._find_checkpoint()
+        if checkpoint_file is None:
+            CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
+            return
+
+        loaded_state = torch.load(checkpoint_file, map_location="cpu")
+        self._start_step = loaded_state["step"] + 1
+        # load the checkpoints for pipeline, optimizers, and gradient scalar
+        self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
+        self.optimizers.load_optimizers(loaded_state["optimizers"])
+        if "schedulers" in loaded_state and self.config.load_scheduler:
+            self.optimizers.load_schedulers(loaded_state["schedulers"])
+        self.grad_scaler.load_state_dict(loaded_state["scalers"])
+        CONSOLE.print(f"Done loading Nerfstudio checkpoint from {checkpoint_file}")
+
+    def _find_checkpoint(self):
         load_dir = self.config.load_dir
         load_checkpoint = self.config.load_checkpoint
         if load_dir is not None:
@@ -398,28 +434,12 @@ class Trainer:
                 load_step = sorted(int(x[x.find("-") + 1 : x.find(".")]) for x in os.listdir(load_dir))[-1]
             load_path: Path = load_dir / f"step-{load_step:09d}.ckpt"
             assert load_path.exists(), f"Checkpoint {load_path} does not exist"
-            loaded_state = torch.load(load_path, map_location="cpu")
-            self._start_step = loaded_state["step"] + 1
-            # load the checkpoints for pipeline, optimizers, and gradient scalar
-            self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
-            self.optimizers.load_optimizers(loaded_state["optimizers"])
-            if "schedulers" in loaded_state and self.config.load_scheduler:
-                self.optimizers.load_schedulers(loaded_state["schedulers"])
-            self.grad_scaler.load_state_dict(loaded_state["scalers"])
-            CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_path}")
+            return load_path
         elif load_checkpoint is not None:
             assert load_checkpoint.exists(), f"Checkpoint {load_checkpoint} does not exist"
-            loaded_state = torch.load(load_checkpoint, map_location="cpu")
-            self._start_step = loaded_state["step"] + 1
-            # load the checkpoints for pipeline, optimizers, and gradient scalar
-            self.pipeline.load_pipeline(loaded_state["pipeline"], loaded_state["step"])
-            self.optimizers.load_optimizers(loaded_state["optimizers"])
-            if "schedulers" in loaded_state and self.config.load_scheduler:
-                self.optimizers.load_schedulers(loaded_state["schedulers"])
-            self.grad_scaler.load_state_dict(loaded_state["scalers"])
-            CONSOLE.print(f"Done loading Nerfstudio checkpoint from {load_checkpoint}")
+            return load_checkpoint
         else:
-            CONSOLE.print("No Nerfstudio checkpoint to load, so training from scratch.")
+            return None
 
     @check_main_thread
     def save_checkpoint(self, step: int) -> None:
@@ -476,6 +496,12 @@ class Trainer:
             for group in self.optimizers.parameters.keys()
             if step % self.gradient_accumulation_steps[group] == self.gradient_accumulation_steps[group] - 1
         ]
+
+        for callback in self.callbacks:
+            callback.run_callback_at_location(
+                step, location=TrainingCallbackLocation.BEFORE_OPTIMIZER_STEP
+            )
+
         self.optimizers.optimizer_scaler_step_some(self.grad_scaler, needs_step)
 
         if self.config.log_gradients:

@@ -181,6 +181,9 @@ class Model(nn.Module):
         Args:
             camera_ray_bundle: ray bundle to calculate outputs over
         """
+        if self.is_image_based():
+            return self.forward(ray_bundle=camera_ray_bundle)
+
         input_device = camera_ray_bundle.directions.device
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
         image_height, image_width = camera_ray_bundle.origins.shape[:2]
@@ -261,3 +264,9 @@ class Model(nn.Module):
         Args:
             step: training step of the loaded checkpoint
         """
+
+    def is_image_based(self):
+        return False
+
+    def modify_optimizer_config(self, config: dict[str, dict[str, Any]]):
+        pass

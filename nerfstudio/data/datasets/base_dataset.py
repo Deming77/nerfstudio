@@ -42,7 +42,7 @@ class InputDataset(Dataset):
         scale_factor: The scaling factor for the dataparser outputs
     """
 
-    exclude_batch_keys_from_device: List[str] = ["image", "mask"]
+    exclude_batch_keys_from_device: List[str] = ["image"]
     cameras: Cameras
 
     def __init__(self, dataparser_outputs: DataparserOutputs, scale_factor: float = 1.0):
@@ -130,6 +130,16 @@ class InputDataset(Dataset):
             assert (
                 data["mask"].shape[:2] == data["image"].shape[:2]
             ), f"Mask and image have different shapes. Got {data['mask'].shape[:2]} and {data['image'].shape[:2]}"
+
+        if "special_mask_filenames" in self._dataparser_outputs.metadata:
+            special_mask_dict: dict[str, list[Path]] = self._dataparser_outputs.metadata["special_mask_filenames"]
+            for mask_key, mask_filenames in special_mask_dict.items():
+                mask_filepath = mask_filenames[image_idx]
+                data[mask_key] = get_image_mask_tensor_from_path(filepath=mask_filepath, scale_factor=self.scale_factor)
+                assert (
+                    data[mask_key].shape[:2] == data["image"].shape[:2]
+                ), f"Mask and image have different shapes. Got {data[mask_key].shape[:2]} and {data['image'].shape[:2]}"
+
         if self.mask_color:
             data["image"] = torch.where(
                 data["mask"] == 1.0, data["image"], torch.ones_like(data["image"]) * torch.tensor(self.mask_color)

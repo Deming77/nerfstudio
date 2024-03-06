@@ -16,9 +16,12 @@
 Input/output utils.
 """
 
+import itertools
 import json
 from pathlib import Path
+from typing import TypeVar
 
+TPath = TypeVar("TPath", str, Path)
 
 def load_from_json(filename: Path):
     """Load a dictionary from a JSON filename.
@@ -41,3 +44,27 @@ def write_to_json(filename: Path, content: dict):
     assert filename.suffix == ".json"
     with open(filename, "w", encoding="UTF-8") as file:
         json.dump(content, file)
+
+
+def globs_sorted(path: str | Path, appendices: str | list[str]) -> list[Path]:
+    """Query globs of the same root path, returns sorted result."""
+    if not isinstance(appendices, list):
+        appendices = [appendices]
+
+    path = Path(path)
+    return sorted(itertools.chain(*[path.glob(app) for app in appendices]))
+
+
+def replace_data_root(path: TPath, new_root: str) -> TPath:
+    indicator = "/data/"
+    idx = str(path).find(indicator)
+    assert idx >= 0
+
+    if not new_root.endswith("/"):
+        new_root += "/"
+    new_path = new_root + str(path)[idx+len(indicator):]
+
+    if isinstance(path, Path):
+        return Path(new_path)
+
+    return new_path
