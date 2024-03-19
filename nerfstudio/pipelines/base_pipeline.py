@@ -373,7 +373,7 @@ class VanillaPipeline(Pipeline):
             assert isinstance(self.datamanager, VanillaDataManager)
             loader = self.datamanager.fixed_indices_eval_dataloader
 
-        camera_ray_bundle, batch = loader.get_data_from_image_idx(loader.image_indices[idx])
+        camera_ray_bundle, batch = loader.get_data_from_image_idx(loader.image_indices[idx], need_rays=not self.model.is_image_based())
         if self.model.is_image_based():
             camera_ray_bundle.metadata["camera"] = loader.cameras[idx]
 

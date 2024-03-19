@@ -19,7 +19,7 @@ Input/output utils.
 import itertools
 import json
 from pathlib import Path
-from typing import TypeVar
+from typing import TypeVar, Union, List
 
 TPath = TypeVar("TPath", str, Path)
 
@@ -30,7 +30,9 @@ def load_from_json(filename: Path):
         filename: The filename to load from.
     """
     assert filename.suffix == ".json"
+    print(filename)
     with open(filename, encoding="UTF-8") as file:
+        print(filename)
         return json.load(file)
 
 
@@ -46,7 +48,7 @@ def write_to_json(filename: Path, content: dict):
         json.dump(content, file)
 
 
-def globs_sorted(path: str | Path, appendices: str | list[str]) -> list[Path]:
+def globs_sorted(path: Union[str,Path], appendices: Union[str,List[str]]) -> List[Path]:
     """Query globs of the same root path, returns sorted result."""
     if not isinstance(appendices, list):
         appendices = [appendices]

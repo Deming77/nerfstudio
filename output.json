@@ -1,0 +1,11 @@
+{
+  "experiment_name": "aaviss-challenge3-pipeline-v2/t01_v01_s00_r08_ImageDensity_A01_iPad_LTS",
+  "method_name": "gss",
+  "checkpoint": "/export/r18c/data/dli/wriva/aaviss-challenge3-pipeline-v2/t01_v01_s00_r08_ImageDensity_A01_iPad_LTS/output/nerfstudio/train/aaviss-challenge3-pipeline-v2/t01_v01_s00_r08_ImageDensity_A01_iPad_LTS/gss/2024-03-07_235830/nerfstudio_models/step-000100000.ckpt",
+  "results": {
+    "num_rays_per_sec": 596567.1875,
+    "num_rays_per_sec_std": 80964.8671875,
+    "fps": 0.8045383095741272,
+    "fps_std": 0.10897264629602432
+  }
+}

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 
 import torch
 import diff_gaussian_rasterization as original_rasterizer
-import diff_gaussian_rasterization_mip_splatting as mip_rasterizer
+# import diff_gaussian_rasterization_mip_splatting as mip_rasterizer
 
 from nerfstudio.fields.gss.gaussian_model import GaussianModel
 from nerfstudio.fields.gss.gss_camera import GssCamera
@@ -94,7 +94,10 @@ def render(
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
+        if mip_kernel_size <= 0:
+            scales = pc.get_scaling
+        else:
+            scales = pc.get_scaling_with_3D_filter
         rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors

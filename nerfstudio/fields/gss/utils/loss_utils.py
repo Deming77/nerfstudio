@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
 from torch import Tensor
+from typing import Union
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -36,14 +37,14 @@ def create_window(window_size: int, channel: int):
     return window
 
 
-def ssim(img1: Tensor, img2: Tensor, window_size=11, size_average=True, mask: Tensor|None=None):
+def ssim(img1: Tensor, img2: Tensor, window_size=11, size_average=True, mask: Union[Tensor,None]=None):
     channel = img1.size(-3)
     window = create_window(window_size, channel).to(img1.device).type_as(img1)
 
     return _ssim(img1, img2, window, window_size, channel, size_average, mask=mask)
 
 
-def _ssim(img1:Tensor, img2, window, window_size, channel, size_average=True, mask: Tensor|None=None):
+def _ssim(img1:Tensor, img2, window, window_size, channel, size_average=True, mask: Union[Tensor,None]=None):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
 

@@ -170,9 +170,9 @@ class Model(nn.Module):
         Args:
             camera: generates raybundle
         """
-        return self.get_outputs_for_camera_ray_bundle(
-            camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
-        )
+        ray_bundle = camera.generate_rays(camera_indices=0, keep_shape=True, obb_box=obb_box)
+        ray_bundle.metadata["camera"] = camera[0]
+        return self.get_outputs_for_camera_ray_bundle(ray_bundle)
 
     @torch.no_grad()
     def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:

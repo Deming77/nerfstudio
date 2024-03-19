@@ -32,11 +32,13 @@ from nerfstudio.utils import colormaps, writer
 from nerfstudio.utils.misc import torch_compile
 from nerfstudio.utils.rich_utils import CONSOLE
 from nerfstudio.utils.timer import timer
-
+from typing import Union, Dict
 
 @dataclass
 class GaussianSplatConfig(ModelConfig):
     _target: Type = field(default_factory=lambda: GaussianSplatModel)
+    enable_collider: bool = False
+    """Overrides base model"""
     appearance: GssAppearanceModelConfig = field(default_factory=GssAppearanceModelConfig)
     renderer: Literal["gss", "gsplat"] = "gss"
     rendering: Literal["gaussian", "pixel"] = "gaussian"
@@ -46,8 +48,8 @@ class GaussianSplatConfig(ModelConfig):
     """
 
     sh_degree: int = 3
-    ply_file: str | None = None
-    npz_file: str | None = None
+    ply_file: Union[str, None] = None
+    npz_file: Union[str, None] = None
     percent_dense: float = 0.01
     lambda_dssim: float = 0.2
     densification_interval: int = 100
@@ -98,7 +100,7 @@ class GaussianSplatModel(Model):
         config: GaussianSplatConfig,
         scene_box: SceneBox,
         num_train_data: int,
-        metadata: dict[str, Tensor],
+        metadata: Union[Dict[str, Tensor]],
         device: str,
         **kwargs,
     ):
@@ -190,7 +192,7 @@ class GaussianSplatModel(Model):
         gss_camera: GssCamera,
         color: Tensor,
         set_extras: bool = False,
-        opacity: Tensor | None = None,
+        opacity: Union[Tensor, None] = None,
     ) -> Tensor:
         if self.config.renderer == "gss":
             outputs = render(
@@ -229,6 +231,7 @@ class GaussianSplatModel(Model):
         """Process a RayBundle object and return RayOutputs describing quanties for each ray."""
         timer.start("gss_get_outputs")
         config = self.config
+  
         camera: Cameras = ray_bundle.metadata["camera"]
         gss_camera = GssCamera.convert_from(camera, self.device)
         timestamp = ray_bundle.metadata["timestamp"].view(-1)[0].item() if "timestamp" in ray_bundle.metadata else 0
@@ -335,11 +338,11 @@ class GaussianSplatModel(Model):
             gt_depth = gt_depth[mask]
 
         result = {}
-        match depth_loss_type:
-            case "median":
-                result["depth_loss"] = weight * compute_depth_loss(pred_depth, gt_depth)
-            case "fsgs":
-                result["depth_loss"] = weight * (1 - pearson_corrcoef(gt_depth.view(-1), pred_depth.view(-1)))
+        if depth_loss_type == "median":
+            result["depth_loss"] = weight * compute_depth_loss(pred_depth, gt_depth)
+        elif depth_loss_type == "fsgs":
+            result["depth_loss"] = weight * (1 - pearson_corrcoef(gt_depth.view(-1), pred_depth.view(-1)))
+
         return result
 
     def _compute_pseudo_loss(self, outputs: dict[str, Tensor]) -> dict[str, Tensor]:

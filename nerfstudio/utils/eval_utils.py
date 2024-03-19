@@ -103,14 +103,14 @@ def eval_setup(
         config = tyro.cli(TrainerConfig, args=extra_args, default=config)
         CONSOLE.print("------------\nOverriden config:\n" + yaml.dump(config) + "------------")
 
-    data_root = os.environ.get("DATA_ROOT", "/data")
-    config.data = replace_data_root(config.data, data_root)
+    # data_root = os.environ.get("DATA_ROOT", "/data")
+    # config.data = replace_data_root(config.data, data_root)
     config.pipeline.datamanager.data = config.data
     CONSOLE.log(f"Data: {config.data}")
 
     mask_path = config.pipeline.datamanager.dataparser.mask_root
-    if mask_path is not None and len(mask_path) > 0:
-        config.pipeline.datamanager.dataparser.mask_root = replace_data_root(mask_path, data_root)
+    # if mask_path is not None and len(mask_path) > 0:
+    #     config.pipeline.datamanager.dataparser.mask_root = replace_data_root(mask_path, data_root)
 
     config.pipeline.datamanager._target = all_methods[config.method_name].pipeline.datamanager._target
     if eval_num_rays_per_chunk:

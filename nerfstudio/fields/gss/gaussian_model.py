@@ -2,13 +2,14 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-import simple_knn_fsgs._C as knn_fsgs
+# import simple_knn_fsgs._C as knn_fsgs
 import torch
 import torch.nn as nn
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import Tensor, nn
 from torch.optim import Optimizer
+from typing import Union, Dict
 
 from nerfstudio.engine.optimizers import Optimizers
 from nerfstudio.fields.gss.utils.general_utils import (
@@ -46,9 +47,9 @@ class GaussianModel(nn.Module):
         percent_dense: float,
         feature_mode: Literal["sh", "feature"] = "sh",
         feature_size: int = 0,
-        state_dict: dict[str, Tensor] | None = None,
-        ply_file: str | None = None,
-        point_cloud: BasicPointCloud | None = None,
+        state_dict: Union[Dict[str, Tensor], None] = None,
+        ply_file: Union[str, None] = None,
+        point_cloud: Union[BasicPointCloud, None] = None,
     ):
         super().__init__()
         assert (
@@ -530,20 +531,20 @@ class GaussianModel(nn.Module):
         )
         self.denom[update_filter] += 1
 
-    def proximity(self, scene_extent, N=3):
-        dist, nearest_indices = knn_fsgs.distCUDA2(self.get_xyz)
-        selected_pts_mask = torch.logical_and(
-            dist > (5.0 * scene_extent), torch.max(self.get_scaling, dim=1).values > (scene_extent)
-        )
+    # def proximity(self, scene_extent, N=3):
+    #     dist, nearest_indices = knn_fsgs.distCUDA2(self.get_xyz)
+    #     selected_pts_mask = torch.logical_and(
+    #         dist > (5.0 * scene_extent), torch.max(self.get_scaling, dim=1).values > (scene_extent)
+    #     )
 
-        new_indices = nearest_indices[selected_pts_mask].reshape(-1).long()
-        source_xyz = self._xyz[selected_pts_mask].repeat(1, N, 1).reshape(-1, 3)
-        target_xyz = self._xyz[new_indices]
-        new_xyz = (source_xyz + target_xyz) / 2
-        new_scaling = self._scaling[new_indices]
-        new_rotation = torch.zeros_like(self._rotation[new_indices])
-        new_rotation[:, 0] = 1
-        new_features_dc = torch.zeros_like(self._features_dc[new_indices])
-        new_features_rest = torch.zeros_like(self._features_rest[new_indices])
-        new_opacity = self._opacity[new_indices]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+    #     new_indices = nearest_indices[selected_pts_mask].reshape(-1).long()
+    #     source_xyz = self._xyz[selected_pts_mask].repeat(1, N, 1).reshape(-1, 3)
+    #     target_xyz = self._xyz[new_indices]
+    #     new_xyz = (source_xyz + target_xyz) / 2
+    #     new_scaling = self._scaling[new_indices]
+    #     new_rotation = torch.zeros_like(self._rotation[new_indices])
+    #     new_rotation[:, 0] = 1
+    #     new_features_dc = torch.zeros_like(self._features_dc[new_indices])
+    #     new_features_rest = torch.zeros_like(self._features_rest[new_indices])
+    #     new_opacity = self._opacity[new_indices]
+    #     self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)

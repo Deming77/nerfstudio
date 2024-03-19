@@ -402,6 +402,7 @@ class VanillaDataManager(DataManager, Generic[TDataset]):
         self.dataparser = self.dataparser_config.setup()
         if test_mode == "inference":
             self.dataparser.downscale_factor = 1  # Avoid opening images
+        self.dataparser.downscale_factor = 4
         self.includes_time = self.dataparser.includes_time
         self.train_dataparser_outputs: DataparserOutputs = self.dataparser.get_dataparser_outputs(split="train")
 

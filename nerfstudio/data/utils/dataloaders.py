@@ -187,12 +187,16 @@ class EvalDataloader(DataLoader):
         assert isinstance(batch, dict)
         return camera, batch
 
-    def get_data_from_image_idx(self, image_idx: int) -> Tuple[RayBundle, Dict]:
+    def get_data_from_image_idx(self, image_idx: int, need_rays: bool) -> Tuple[RayBundle, Dict]:
         """Returns the data for a specific image index.
 
         Args:
             image_idx: Camera image index
         """
+        if need_rays:
+            ray_bundle = self.cameras.generate_rays(camera_indices=image_idx, keep_shape=True)
+        else:
+            ray_bundle = RayBundle(None, None, None, torch.ones(1, 1, 1) * image_idx) 
         ray_bundle = self.cameras.generate_rays(camera_indices=image_idx, keep_shape=True)
         batch = self.input_dataset[image_idx]
         batch = get_dict_to_torch(batch, device=self.device, exclude=["image"])

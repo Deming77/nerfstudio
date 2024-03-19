@@ -93,7 +93,7 @@ class Nerfstudio(DataParser):
 
     def __init__(self, config: NerfstudioDataParserConfig):
         super().__init__(config)
-
+        print(self.config.data)
         if self.config.data.suffix == ".json":
             meta = load_from_json(self.config.data)
             data_dir = self.config.data.parent
