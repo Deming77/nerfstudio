@@ -125,7 +125,7 @@ class ColmapDataParser(DataParser):
     def __init__(self, config: ColmapDataParserConfig):
         super().__init__(config)
         self.config = config
-        self._downscale_factor = None
+        self._downscale_factor = 1
 
     def _get_all_images_and_cameras(self, recon_dir: Path):
         if (recon_dir / "cameras.txt").exists():
@@ -318,7 +318,8 @@ class ColmapDataParser(DataParser):
         image_filenames, mask_filenames, depth_filenames, downscale_factor = self._setup_downscale_factor(
             image_filenames, mask_filenames, depth_filenames
         )
-
+        
+        # print(downscale_factor, '@@@@@@@@@@@@@@@@')
         image_filenames = [image_filenames[i] for i in indices]
         mask_filenames = [mask_filenames[i] for i in indices] if len(mask_filenames) > 0 else []
         depth_filenames = [depth_filenames[i] for i in indices] if len(depth_filenames) > 0 else []
